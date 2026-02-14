@@ -118,7 +118,11 @@ def train_and_predict(df, target_dt_utc):
 # 2. Streamlit UI
 # ---------------------------------------------------------
 
-st.set_page_config(page_title="FX Price Predictor AI", layout="wide")
+st.set_page_config(
+    page_title="FX AI予測",     # ここがアプリ名になります
+    page_icon="📈",            # ここがアイコンになります（絵文字が一番確実です）
+    layout="wide"
+)
 st.title("💹 AI FX 6時間後トレンド予測ツール")
 
 # --- サイドバー設定 ---
