@@ -10,6 +10,18 @@ import pytz
 # 1. 設定と関数定義
 # ---------------------------------------------------------
 
+def get_usdjpy_rate():
+    """日本円換算用にUSDJPYの現在レートを取得する"""
+    try:
+        ticker = yf.Ticker("USDJPY=X")
+        # 直近1日のデータを取得
+        data = ticker.history(period="1d")
+        if not data.empty:
+            return data['Close'].iloc[-1]
+        return 150.0 # 取得失敗時のフェイルセーフ
+    except:
+        return 150.0
+
 def calculate_technical_indicators(df):
     """テクニカル指標を計算"""
     df = df.copy()
@@ -91,7 +103,7 @@ def fetch_and_process_data(ticker, target_dt_jst):
     return df_1h, target_dt_utc, target_dt_jst
 
 def train_and_predict(df, target_dt_utc):
-    """学習と予測を実行 (重要度抽出を追加)"""
+    """学習と予測を実行"""
     
     train_data = df[df.index < target_dt_utc].dropna().copy()
     
@@ -126,7 +138,6 @@ def train_and_predict(df, target_dt_utc):
 
     proba = model.predict_proba(X_target)[0]
     
-    # --- 重要度の取得 (NEW) ---
     importances = model.feature_importances_
     feature_importance_df = pd.DataFrame({
         'Feature': features,
@@ -212,7 +223,18 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("資金・リスク管理")
-trade_units = st.sidebar.number_input("取引通貨量 (Units)", 1000, 1000000, 10000, 1000)
+
+# --- 変更箇所: 最小値を0.01、型をfloatに変更 ---
+trade_units = st.sidebar.number_input(
+    "取引通貨量 (Units)", 
+    min_value=0.01, 
+    max_value=10000000.0, 
+    value=10000.0, 
+    step=0.01,
+    format="%.2f",
+    help="0.01から入力可能です。"
+)
+
 risk_reward_ratio = st.sidebar.number_input("リスクリワード比", 1.0, 10.0, 2.0, 0.1)
 sl_atr_multiplier = st.sidebar.slider("損切り幅 (ATR倍率)", 1.0, 3.0, 1.5, 0.1)
 
@@ -239,12 +261,23 @@ if st.sidebar.button("予測を実行"):
             result = train_and_predict(df, target_dt_utc)
             
             if result:
-                # 戻り値に feature_importance_df が追加されています
                 proba, price_now, price_6h, used_time_utc, atr_val, fi_df = result
                 
                 used_time_jst = used_time_utc.astimezone(jst)
                 down_prob = proba[0] * 100
                 up_prob = proba[1] * 100
+                
+                # --- 通貨換算準備 ---
+                usdjpy_rate = 1.0
+                currency_label = "pips/通貨"
+                conversion_note = ""
+                
+                if "JPY" in ticker:
+                    currency_label = "円"
+                elif "USD" in ticker:
+                    usdjpy_rate = get_usdjpy_rate()
+                    currency_label = "円 (概算)"
+                    conversion_note = f"(USDJPYレート @ {usdjpy_rate:.2f} で換算)"
                 
                 # --- 結果表示レイアウト ---
                 st.markdown("---")
@@ -255,7 +288,6 @@ if st.sidebar.button("予測を実行"):
                 
                 ai_direction = "UP ↗️" if up_prob > down_prob else "DOWN ↘️"
                 ai_confidence = max(up_prob, down_prob)
-                currency_label = "円" if "JPY" in ticker else "pips/通貨"
                 
                 kpi1, kpi2, kpi3 = st.columns(3)
 
@@ -277,16 +309,20 @@ if st.sidebar.button("予測を実行"):
                     delta=f"確信度: {ai_confidence:.1f}%"
                 )
 
-                # 損益計算
+                # 損益計算 (日本円対応)
                 if not is_future:
-                    profit_loss_val = (price_6h - price_now) * trade_units if up_prob > down_prob else (price_now - price_6h) * trade_units
-                    bg_color = "#d4edda" if profit_loss_val > 0 else "#f8d7da"
-                    sign_str = "+" if profit_loss_val > 0 else ""
+                    raw_profit = (price_6h - price_now) * trade_units if up_prob > down_prob else (price_now - price_6h) * trade_units
+                    final_profit = raw_profit * usdjpy_rate
                     
+                    bg_color = "#d4edda" if final_profit > 0 else "#f8d7da"
+                    sign_str = "+" if final_profit > 0 else ""
+                    
+                    # 小数点以下も表示するようにフォーマット調整（0.01単位の取引に対応するため）
                     st.markdown(f"""
                     <div style="background-color:{bg_color}; padding:15px; border-radius:10px; margin-top:10px; text-align:center;">
-                        <h4 style="margin:0;">💰 もしAIに従って {trade_units:,} 通貨取引していたら...</h4>
-                        <h2 style="margin:0; color:{'green' if profit_loss_val>0 else 'red'}">{sign_str}{profit_loss_val:,.0f} {currency_label}</h2>
+                        <h4 style="margin:0;">💰 もしAIに従って {trade_units:,.2f} 通貨取引していたら...</h4>
+                        <h2 style="margin:0; color:{'green' if final_profit>0 else 'red'}">{sign_str}{final_profit:,.2f} {currency_label}</h2>
+                        <small>{conversion_note}</small>
                     </div>
                     """, unsafe_allow_html=True)
                 else:
@@ -303,18 +339,18 @@ if st.sidebar.button("予測を実行"):
                     trade_type = "BUY"
                     tp_price = price_now + tp_distance
                     sl_price = price_now - sl_distance
-                    est_profit = tp_distance * trade_units
-                    est_loss = sl_distance * trade_units
                     sl_color = "red"
                     tp_color = "green"
                 else:
                     trade_type = "SELL"
                     tp_price = price_now - tp_distance
                     sl_price = price_now + sl_distance
-                    est_profit = tp_distance * trade_units
-                    est_loss = sl_distance * trade_units
                     sl_color = "red"
                     tp_color = "green"
+
+                # 予定損益の計算
+                est_profit = (tp_distance * trade_units) * usdjpy_rate
+                est_loss = (sl_distance * trade_units) * usdjpy_rate
 
                 sim_result, _ = simulate_trade(df, used_time_utc, trade_type, price_now, tp_price, sl_price)
 
@@ -335,6 +371,8 @@ if st.sidebar.button("予測を実行"):
                     st.markdown(f"<h3 style='text-align: center;'>Entry</h3>", unsafe_allow_html=True)
                     st.markdown(f"<h2 style='text-align: center;'>{price_now:.3f}</h2>", unsafe_allow_html=True)
                     st.markdown(f"<div style='text-align: center; font-weight:bold; padding:5px; background-color:#333; color:white; border-radius:5px;'>{trade_type}</div>", unsafe_allow_html=True)
+                    if conversion_note:
+                        st.caption(f"※{conversion_note}")
 
                 with col_sl:
                     st.markdown(f"<div style='{sl_bg} padding:10px; border-radius:10px; border:1px solid #ddd;'>", unsafe_allow_html=True)
@@ -346,36 +384,14 @@ if st.sidebar.button("予測を実行"):
 
                 st.caption(f"※ ライン計算基準: ATR={atr_val:.3f} / RR比=1:{risk_reward_ratio}")
 
-                # --- 根拠の可視化 (NEW) ---
+                # --- 根拠の可視化 ---
                 st.markdown("---")
-                st.subheader("🧠 なぜこの予測になったのか？ (AIの判断根拠)")
-                st.write("AIが今回の予測を行う上で、特に重要視したデータのランキングです。")
-                
-                # 重要度を棒グラフで表示
-                # わかりやすくするために正規化して表示
+                st.subheader("🧠 なぜこの予測になったのか？")
                 fi_df['Importance'] = fi_df['Importance'] / fi_df['Importance'].sum()
                 st.bar_chart(fi_df.set_index('Feature'))
                 
-                # 上位3つの要素をテキストで解説
-                top_features = fi_df.head(3)['Feature'].tolist()
-                st.markdown(f"""
-                **💡 AIの注目ポイント:**
-                今回の相場では、特に **{top_features[0]}**, **{top_features[1]}**, **{top_features[2]}** の動きが予測の決め手になりました。
-                """)
-                
-                with st.expander("各指標の意味（初心者向け解説）"):
-                    st.markdown("""
-                    * **RSI / RSI_Lag1:** 「買われすぎ・売られすぎ」のサイン。数値が高いと反落、低いと反発しやすい。
-                    * **MACD / MACD_Hist:** トレンドの転換点。プラスなら上昇、マイナスなら下降トレンドの可能性。
-                    * **Momentum:** 相場の勢い。
-                    * **BB_upper / lower:** ボリンジャーバンド。価格がこれに触れると行き過ぎのサイン。
-                    * **Slope:** 移動平均線の傾き。トレンドの強さを表す。
-                    """)
-
                 # --- チャートと確率 ---
                 st.markdown("---")
-                st.subheader("📉 チャートと確率詳細")
-                
                 col_up, col_down = st.columns(2)
                 with col_up:
                     st.write(f"📈 上昇確率: {up_prob:.1f}%")
