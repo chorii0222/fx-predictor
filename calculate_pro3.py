@@ -14,11 +14,10 @@ def get_usdjpy_rate():
     """日本円換算用にUSDJPYの現在レートを取得する"""
     try:
         ticker = yf.Ticker("USDJPY=X")
-        # 直近1日のデータを取得
         data = ticker.history(period="1d")
         if not data.empty:
             return data['Close'].iloc[-1]
-        return 150.0 # 取得失敗時のフェイルセーフ
+        return 150.0
     except:
         return 150.0
 
@@ -224,7 +223,6 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("資金・リスク管理")
 
-# --- 変更箇所: 最小値を0.01、型をfloatに変更 ---
 trade_units = st.sidebar.number_input(
     "取引通貨量 (Units)", 
     min_value=0.01, 
@@ -236,7 +234,15 @@ trade_units = st.sidebar.number_input(
 )
 
 risk_reward_ratio = st.sidebar.number_input("リスクリワード比", 1.0, 10.0, 2.0, 0.1)
-sl_atr_multiplier = st.sidebar.slider("損切り幅 (ATR倍率)", 1.0, 3.0, 1.5, 0.1)
+
+sl_atr_multiplier = st.sidebar.number_input(
+    "損切り幅 (ATR倍率)",
+    min_value=0.01, 
+    max_value=10.0, 
+    value=1.5, 
+    step=0.01,
+    help="0.01単位で設定可能です。値を小さくすると損切り幅が狭くなります。"
+)
 
 jst = pytz.timezone('Asia/Tokyo')
 
@@ -279,6 +285,10 @@ if st.sidebar.button("予測を実行"):
                     currency_label = "円 (概算)"
                     conversion_note = f"(USDJPYレート @ {usdjpy_rate:.2f} で換算)"
                 
+                # --- 価格表示の桁数設定 (NEW) ---
+                # JPYが含まれる場合は3桁、それ以外は5桁
+                p_fmt = ".3f" if "JPY" in ticker else ".5f"
+
                 # --- 結果表示レイアウト ---
                 st.markdown("---")
                 st.subheader("📊 予測結果と損益シミュレーション")
@@ -291,15 +301,15 @@ if st.sidebar.button("予測を実行"):
                 
                 kpi1, kpi2, kpi3 = st.columns(3)
 
-                kpi1.metric(label="🏁 開始価格", value=f"{price_now:.3f}")
+                kpi1.metric(label="🏁 開始価格", value=f"{price_now:{p_fmt}}")
 
                 if is_future:
                     kpi2.metric(label="🏁 6時間後の価格", value="未確定 (未来)", delta="Waiting...")
                 else:
                     kpi2.metric(
                         label="🏁 6時間後の価格 (実際)",
-                        value=f"{price_6h:.3f}",
-                        delta=f"{diff:.3f}",
+                        value=f"{price_6h:{p_fmt}}",
+                        delta=f"{diff:{p_fmt}}",
                         delta_color="inverse" if "JPY" in ticker and diff < 0 else "normal"
                     )
 
@@ -317,7 +327,6 @@ if st.sidebar.button("予測を実行"):
                     bg_color = "#d4edda" if final_profit > 0 else "#f8d7da"
                     sign_str = "+" if final_profit > 0 else ""
                     
-                    # 小数点以下も表示するようにフォーマット調整（0.01単位の取引に対応するため）
                     st.markdown(f"""
                     <div style="background-color:{bg_color}; padding:15px; border-radius:10px; margin-top:10px; text-align:center;">
                         <h4 style="margin:0;">💰 もしAIに従って {trade_units:,.2f} 通貨取引していたら...</h4>
@@ -362,14 +371,14 @@ if st.sidebar.button("予測を実行"):
                 with col_tp:
                     st.markdown(f"<div style='{tp_bg} padding:10px; border-radius:10px; border:1px solid #ddd;'>", unsafe_allow_html=True)
                     st.markdown(f"<h3 style='color:{tp_color}; text-align: center;'>🎯 利確 (TP)</h3>", unsafe_allow_html=True)
-                    st.markdown(f"<h2 style='text-align: center;'>{tp_price:.3f}</h2>", unsafe_allow_html=True)
+                    st.markdown(f"<h2 style='text-align: center;'>{tp_price:{p_fmt}}</h2>", unsafe_allow_html=True)
                     st.markdown(f"<p style='text-align: center;'>予定利益: <b>+{est_profit:,.0f} {currency_label}</b></p>", unsafe_allow_html=True)
                     if sim_result == "WIN": st.markdown(f"<p style='text-align: center; color:green; font-weight:bold; background:white;'>✅ 達成</p>", unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
                     
                 with col_entry:
                     st.markdown(f"<h3 style='text-align: center;'>Entry</h3>", unsafe_allow_html=True)
-                    st.markdown(f"<h2 style='text-align: center;'>{price_now:.3f}</h2>", unsafe_allow_html=True)
+                    st.markdown(f"<h2 style='text-align: center;'>{price_now:{p_fmt}}</h2>", unsafe_allow_html=True)
                     st.markdown(f"<div style='text-align: center; font-weight:bold; padding:5px; background-color:#333; color:white; border-radius:5px;'>{trade_type}</div>", unsafe_allow_html=True)
                     if conversion_note:
                         st.caption(f"※{conversion_note}")
@@ -377,12 +386,12 @@ if st.sidebar.button("予測を実行"):
                 with col_sl:
                     st.markdown(f"<div style='{sl_bg} padding:10px; border-radius:10px; border:1px solid #ddd;'>", unsafe_allow_html=True)
                     st.markdown(f"<h3 style='color:{sl_color}; text-align: center;'>🛑 損切り (SL)</h3>", unsafe_allow_html=True)
-                    st.markdown(f"<h2 style='text-align: center;'>{sl_price:.3f}</h2>", unsafe_allow_html=True)
+                    st.markdown(f"<h2 style='text-align: center;'>{sl_price:{p_fmt}}</h2>", unsafe_allow_html=True)
                     st.markdown(f"<p style='text-align: center;'>予定損失: <b>-{est_loss:,.0f} {currency_label}</b></p>", unsafe_allow_html=True)
                     if sim_result == "LOSS": st.markdown(f"<p style='text-align: center; color:red; font-weight:bold; background:white;'>❌ 損切り</p>", unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
 
-                st.caption(f"※ ライン計算基準: ATR={atr_val:.3f} / RR比=1:{risk_reward_ratio}")
+                st.caption(f"※ ライン計算基準: ATR={atr_val:{p_fmt}} / RR比=1:{risk_reward_ratio}")
 
                 # --- 根拠の可視化 ---
                 st.markdown("---")
