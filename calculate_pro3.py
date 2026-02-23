@@ -83,7 +83,7 @@ def fetch_and_process_data(ticker, target_dt_jst):
         return None, None, None
 
     if df_1h.empty:
-        st.error("指定された期間のデータが見つかりませんでした。")
+        st.error(f"{ticker} の指定された期間のデータが見つかりませんでした。")
         return None, None, None
 
     if df_1h.index.tz is None:
@@ -206,7 +206,15 @@ if 'init_done' not in st.session_state:
     st.session_state.default_time = time(now.hour, 0)
     st.session_state.init_done = True
 
-ticker = st.sidebar.text_input("通貨ペア", "USDJPY=X")
+# --- 通貨ペア設定 ---
+st.sidebar.subheader("通貨ペア設定")
+ticker1 = st.sidebar.text_input("通貨ペア 1", "USDJPY=X")
+
+use_second_ticker = st.sidebar.checkbox("➕ 2つ目の通貨ペアも分析する", value=False)
+if use_second_ticker:
+    ticker2 = st.sidebar.text_input("通貨ペア 2", "EURUSD=X")
+else:
+    ticker2 = None
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("日時設定")
@@ -220,29 +228,28 @@ else:
     input_date = st.sidebar.date_input("日付", value=st.session_state.default_date)
     input_time = st.sidebar.time_input("時間 (JST)", value=st.session_state.default_time)
 
+# --- 資金・リスク管理 (各通貨ペアごとに独立設定) ---
 st.sidebar.markdown("---")
-st.sidebar.subheader("資金・リスク管理")
+st.sidebar.subheader(f"資金・リスク管理 (1つ目: {ticker1})")
 
-trade_units = st.sidebar.number_input(
-    "取引通貨量 (Units)", 
-    min_value=0.01, 
-    max_value=10000000.0, 
-    value=10000.0, 
-    step=0.01,
-    format="%.2f",
-    help="0.01から入力可能です。"
+trade_units_1 = st.sidebar.number_input(
+    f"取引通貨量 ({ticker1})", 
+    min_value=0.01, max_value=10000000.0, value=10000.0, step=0.01, format="%.2f",
+    key="units_1"
 )
+risk_reward_ratio_1 = st.sidebar.number_input(f"リスクリワード比 ({ticker1})", 1.0, 10.0, 2.0, 0.1, key="rr_1")
+sl_atr_multiplier_1 = st.sidebar.number_input(f"損切り幅 (ATR倍率) ({ticker1})", 0.01, 10.0, 1.5, 0.01, key="sl_1")
 
-risk_reward_ratio = st.sidebar.number_input("リスクリワード比", 1.0, 10.0, 2.0, 0.1)
-
-sl_atr_multiplier = st.sidebar.number_input(
-    "損切り幅 (ATR倍率)",
-    min_value=0.01, 
-    max_value=10.0, 
-    value=1.5, 
-    step=0.01,
-    help="0.01単位で設定可能です。値を小さくすると損切り幅が狭くなります。"
-)
+if use_second_ticker and ticker2:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader(f"資金・リスク管理 (2つ目: {ticker2})")
+    trade_units_2 = st.sidebar.number_input(
+        f"取引通貨量 ({ticker2})", 
+        min_value=0.01, max_value=10000000.0, value=10000.0, step=0.01, format="%.2f",
+        key="units_2"
+    )
+    risk_reward_ratio_2 = st.sidebar.number_input(f"リスクリワード比 ({ticker2})", 1.0, 10.0, 2.0, 0.1, key="rr_2")
+    sl_atr_multiplier_2 = st.sidebar.number_input(f"損切り幅 (ATR倍率) ({ticker2})", 0.01, 10.0, 1.5, 0.01, key="sl_2")
 
 jst = pytz.timezone('Asia/Tokyo')
 
@@ -255,162 +262,228 @@ else:
 st.sidebar.markdown("---")
 
 if st.sidebar.button("予測を実行"):
-    st.write(f"### 分析対象: {ticker}")
     st.caption(f"基準日時 (JST): {target_dt_jst.strftime('%Y-%m-%d %H:%M:%S')}")
     if use_realtime:
         st.markdown("**🔴 リアルタイム・モード** で実行中")
-    
-    with st.spinner('データを取得・AI解析中...'):
-        df, target_dt_utc, _ = fetch_and_process_data(ticker, target_dt_jst)
         
-        if df is not None:
-            result = train_and_predict(df, target_dt_utc)
+    # 分析対象のリストを作成し、それぞれのリスク管理設定を保持
+    tickers_to_process = [
+        {'tk': ticker1, 'units': trade_units_1, 'rr': risk_reward_ratio_1, 'sl_atr': sl_atr_multiplier_1}
+    ]
+    if use_second_ticker and ticker2:
+        tickers_to_process.append(
+            {'tk': ticker2, 'units': trade_units_2, 'rr': risk_reward_ratio_2, 'sl_atr': sl_atr_multiplier_2}
+        )
+        
+    analysis_results = []
+    total_final_profit = 0
+    total_est_profit = 0
+    total_est_loss = 0
+    is_future_global = False
+
+    # 各通貨ごとに処理ループ
+    for item in tickers_to_process:
+        tk = item['tk']
+        trade_units = item['units']
+        risk_reward_ratio = item['rr']
+        sl_atr_multiplier = item['sl_atr']
+        
+        with st.spinner(f'{tk} のデータを取得・AI解析中...'):
+            df, target_dt_utc, _ = fetch_and_process_data(tk, target_dt_jst)
             
-            if result:
-                proba, price_now, price_6h, used_time_utc, atr_val, fi_df = result
+            if df is not None:
+                result = train_and_predict(df, target_dt_utc)
                 
-                used_time_jst = used_time_utc.astimezone(jst)
-                down_prob = proba[0] * 100
-                up_prob = proba[1] * 100
-                
-                # --- 通貨換算準備 ---
-                usdjpy_rate = 1.0
-                currency_label = "pips/通貨"
-                conversion_note = ""
-                
-                if "JPY" in ticker:
-                    currency_label = "円"
-                elif "USD" in ticker:
-                    usdjpy_rate = get_usdjpy_rate()
-                    currency_label = "円 (概算)"
-                    conversion_note = f"(USDJPYレート @ {usdjpy_rate:.2f} で換算)"
-                
-                # --- 価格表示の桁数設定 (NEW) ---
-                # JPYが含まれる場合は3桁、それ以外は5桁
-                p_fmt = ".3f" if "JPY" in ticker else ".5f"
+                if result:
+                    proba, price_now, price_6h, used_time_utc, atr_val, fi_df = result
+                    
+                    used_time_jst = used_time_utc.astimezone(jst)
+                    down_prob = proba[0] * 100
+                    up_prob = proba[1] * 100
+                    
+                    usdjpy_rate = 1.0
+                    currency_label = "pips/通貨"
+                    conversion_note = ""
+                    
+                    if "JPY" in tk:
+                        currency_label = "円"
+                    elif "USD" in tk:
+                        usdjpy_rate = get_usdjpy_rate()
+                        currency_label = "円 (概算)"
+                        conversion_note = f"(USDJPYレート @ {usdjpy_rate:.2f} で換算)"
+                    
+                    p_fmt = ".3f" if "JPY" in tk else ".5f"
 
-                # --- 結果表示レイアウト ---
-                st.markdown("---")
-                st.subheader("📊 予測結果と損益シミュレーション")
+                    is_future = np.isnan(price_6h)
+                    is_future_global = is_future # 両方とも未来か過去かは同じはずなので保持
+                    diff = 0 if is_future else price_6h - price_now
+                    
+                    ai_direction = "UP ↗️" if up_prob > down_prob else "DOWN ↘️"
+                    ai_confidence = max(up_prob, down_prob)
+                    
+                    # 損益計算 (日本円対応)
+                    final_profit = 0
+                    if not is_future:
+                        raw_profit = (price_6h - price_now) * trade_units if up_prob > down_prob else (price_now - price_6h) * trade_units
+                        final_profit = raw_profit * usdjpy_rate
+                    
+                    sl_distance = atr_val * sl_atr_multiplier
+                    tp_distance = sl_distance * risk_reward_ratio
+                    
+                    if up_prob > down_prob:
+                        trade_type = "BUY"
+                        tp_price = price_now + tp_distance
+                        sl_price = price_now - sl_distance
+                        sl_color = "red"
+                        tp_color = "green"
+                    else:
+                        trade_type = "SELL"
+                        tp_price = price_now - tp_distance
+                        sl_price = price_now + sl_distance
+                        sl_color = "red"
+                        tp_color = "green"
 
-                is_future = np.isnan(price_6h)
-                diff = 0 if is_future else price_6h - price_now
-                
-                ai_direction = "UP ↗️" if up_prob > down_prob else "DOWN ↘️"
-                ai_confidence = max(up_prob, down_prob)
-                
-                kpi1, kpi2, kpi3 = st.columns(3)
+                    est_profit = (tp_distance * trade_units) * usdjpy_rate
+                    est_loss = (sl_distance * trade_units) * usdjpy_rate
 
-                kpi1.metric(label="🏁 開始価格", value=f"{price_now:{p_fmt}}")
+                    sim_result, _ = simulate_trade(df, used_time_utc, trade_type, price_now, tp_price, sl_price)
 
-                if is_future:
-                    kpi2.metric(label="🏁 6時間後の価格", value="未確定 (未来)", delta="Waiting...")
-                else:
-                    kpi2.metric(
-                        label="🏁 6時間後の価格 (実際)",
-                        value=f"{price_6h:{p_fmt}}",
-                        delta=f"{diff:{p_fmt}}",
-                        delta_color="inverse" if "JPY" in ticker and diff < 0 else "normal"
-                    )
+                    # 合計用に加算
+                    total_final_profit += final_profit
+                    total_est_profit += est_profit
+                    total_est_loss += est_loss
 
-                kpi3.metric(
-                    label="🤖 AIの予測",
-                    value=f"{ai_direction}",
-                    delta=f"確信度: {ai_confidence:.1f}%"
+                    # 結果をリストに保存
+                    analysis_results.append({
+                        'tk': tk, 'trade_units': trade_units, 'risk_reward_ratio': risk_reward_ratio, 
+                        'df': df, 'price_now': price_now, 'price_6h': price_6h,
+                        'used_time_jst': used_time_jst, 'down_prob': down_prob, 'up_prob': up_prob,
+                        'usdjpy_rate': usdjpy_rate, 'currency_label': currency_label, 'conversion_note': conversion_note,
+                        'p_fmt': p_fmt, 'is_future': is_future, 'diff': diff,
+                        'ai_direction': ai_direction, 'ai_confidence': ai_confidence,
+                        'final_profit': final_profit, 'sl_distance': sl_distance, 'tp_distance': tp_distance,
+                        'trade_type': trade_type, 'tp_price': tp_price, 'sl_price': sl_price,
+                        'sl_color': sl_color, 'tp_color': tp_color, 'est_profit': est_profit,
+                        'est_loss': est_loss, 'sim_result': sim_result, 'atr_val': atr_val, 'fi_df': fi_df
+                    })
+
+    # ==========================================
+    # 結果の描画
+    # ==========================================
+    if len(analysis_results) > 0:
+        
+        # --- 総合結果表示 (2通貨ペアの場合のみ表示) ---
+        if len(analysis_results) > 1:
+            st.markdown("---")
+            st.markdown("## 🌐 総合シミュレーション結果 (2通貨ペア合計)")
+            
+            if not is_future_global:
+                bg_color = "#d4edda" if total_final_profit > 0 else "#f8d7da"
+                sign_str = "+" if total_final_profit > 0 else ""
+                st.markdown(f"""
+                <div style="background-color:{bg_color}; padding:15px; border-radius:10px; margin-top:10px; text-align:center; border: 2px solid {'green' if total_final_profit>0 else 'red'};">
+                    <h4 style="margin:0;">💰 合計 確定損益</h4>
+                    <h1 style="margin:0; color:{'green' if total_final_profit>0 else 'red'}">{sign_str}{total_final_profit:,.2f} 円</h1>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.info("🕒 現在進行中のため、確定損益はまだありません。")
+                st.markdown(f"""
+                <div style="padding:15px; border-radius:10px; margin-top:10px; text-align:center; border:2px solid #ddd; background-color:#f8f9fa;">
+                    <h4 style="margin:0;">📊 合計 予定損益</h4>
+                    <p style="margin:5px 0; font-size:22px;">予定利益合計: <span style="color:green; font-weight:bold;">+{total_est_profit:,.0f} 円</span></p>
+                    <p style="margin:5px 0; font-size:22px;">予定損失合計: <span style="color:red; font-weight:bold;">-{total_est_loss:,.0f} 円</span></p>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # --- 各通貨ペアの詳細表示ループ ---
+        for res in analysis_results:
+            st.markdown("---")
+            st.markdown(f"## 📌 詳細分析: {res['tk']}")
+            
+            st.subheader("📊 予測結果と損益シミュレーション")
+            
+            kpi1, kpi2, kpi3 = st.columns(3)
+
+            kpi1.metric(label="🏁 開始価格", value=f"{res['price_now']:{res['p_fmt']}}")
+
+            if res['is_future']:
+                kpi2.metric(label="🏁 6時間後の価格", value="未確定 (未来)", delta="Waiting...")
+            else:
+                kpi2.metric(
+                    label="🏁 6時間後の価格 (実際)",
+                    value=f"{res['price_6h']:{res['p_fmt']}}",
+                    delta=f"{res['diff']:{res['p_fmt']}}",
+                    delta_color="inverse" if "JPY" in res['tk'] and res['diff'] < 0 else "normal"
                 )
 
-                # 損益計算 (日本円対応)
-                if not is_future:
-                    raw_profit = (price_6h - price_now) * trade_units if up_prob > down_prob else (price_now - price_6h) * trade_units
-                    final_profit = raw_profit * usdjpy_rate
-                    
-                    bg_color = "#d4edda" if final_profit > 0 else "#f8d7da"
-                    sign_str = "+" if final_profit > 0 else ""
-                    
-                    st.markdown(f"""
-                    <div style="background-color:{bg_color}; padding:15px; border-radius:10px; margin-top:10px; text-align:center;">
-                        <h4 style="margin:0;">💰 もしAIに従って {trade_units:,.2f} 通貨取引していたら...</h4>
-                        <h2 style="margin:0; color:{'green' if final_profit>0 else 'red'}">{sign_str}{final_profit:,.2f} {currency_label}</h2>
-                        <small>{conversion_note}</small>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    st.info("🕒 現在進行中のため、確定損益はまだありません。")
+            kpi3.metric(
+                label="🤖 AIの予測",
+                value=f"{res['ai_direction']}",
+                delta=f"確信度: {res['ai_confidence']:.1f}%"
+            )
 
-                # --- トレードシナリオ ---
-                st.markdown("---")
-                st.subheader("🛡️ トレードシナリオ (TP/SL)")
+            if not res['is_future']:
+                bg_color = "#d4edda" if res['final_profit'] > 0 else "#f8d7da"
+                sign_str = "+" if res['final_profit'] > 0 else ""
                 
-                sl_distance = atr_val * sl_atr_multiplier
-                tp_distance = sl_distance * risk_reward_ratio
+                st.markdown(f"""
+                <div style="background-color:{bg_color}; padding:15px; border-radius:10px; margin-top:10px; text-align:center;">
+                    <h4 style="margin:0;">💰 もしAIに従って {res['trade_units']:,.2f} 通貨取引していたら...</h4>
+                    <h2 style="margin:0; color:{'green' if res['final_profit']>0 else 'red'}">{sign_str}{res['final_profit']:,.2f} {res['currency_label']}</h2>
+                    <small>{res['conversion_note']}</small>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown("---")
+            st.subheader("🛡️ トレードシナリオ (TP/SL)")
+            
+            col_tp, col_entry, col_sl = st.columns(3)
+            
+            tp_bg = "background-color:#d4edda;" if res['sim_result'] == "WIN" else ""
+            sl_bg = "background-color:#f8d7da;" if res['sim_result'] == "LOSS" else ""
+            
+            with col_tp:
+                st.markdown(f"<div style='{tp_bg} padding:10px; border-radius:10px; border:1px solid #ddd;'>", unsafe_allow_html=True)
+                st.markdown(f"<h3 style='color:{res['tp_color']}; text-align: center;'>🎯 利確 (TP)</h3>", unsafe_allow_html=True)
+                st.markdown(f"<h2 style='text-align: center;'>{res['tp_price']:{res['p_fmt']}}</h2>", unsafe_allow_html=True)
+                st.markdown(f"<p style='text-align: center;'>予定利益: <b>+{res['est_profit']:,.0f} {res['currency_label']}</b></p>", unsafe_allow_html=True)
+                if res['sim_result'] == "WIN": st.markdown(f"<p style='text-align: center; color:green; font-weight:bold; background:white;'>✅ 達成</p>", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
                 
-                if up_prob > down_prob:
-                    trade_type = "BUY"
-                    tp_price = price_now + tp_distance
-                    sl_price = price_now - sl_distance
-                    sl_color = "red"
-                    tp_color = "green"
-                else:
-                    trade_type = "SELL"
-                    tp_price = price_now - tp_distance
-                    sl_price = price_now + sl_distance
-                    sl_color = "red"
-                    tp_color = "green"
+            with col_entry:
+                st.markdown(f"<h3 style='text-align: center;'>Entry</h3>", unsafe_allow_html=True)
+                st.markdown(f"<h2 style='text-align: center;'>{res['price_now']:{res['p_fmt']}}</h2>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align: center; font-weight:bold; padding:5px; background-color:#333; color:white; border-radius:5px;'>{res['trade_type']}</div>", unsafe_allow_html=True)
+                if res['conversion_note']:
+                    st.caption(f"※{res['conversion_note']}")
 
-                # 予定損益の計算
-                est_profit = (tp_distance * trade_units) * usdjpy_rate
-                est_loss = (sl_distance * trade_units) * usdjpy_rate
+            with col_sl:
+                st.markdown(f"<div style='{sl_bg} padding:10px; border-radius:10px; border:1px solid #ddd;'>", unsafe_allow_html=True)
+                st.markdown(f"<h3 style='color:{res['sl_color']}; text-align: center;'>🛑 損切り (SL)</h3>", unsafe_allow_html=True)
+                st.markdown(f"<h2 style='text-align: center;'>{res['sl_price']:{res['p_fmt']}}</h2>", unsafe_allow_html=True)
+                st.markdown(f"<p style='text-align: center;'>予定損失: <b>-{res['est_loss']:,.0f} {res['currency_label']}</b></p>", unsafe_allow_html=True)
+                if res['sim_result'] == "LOSS": st.markdown(f"<p style='text-align: center; color:red; font-weight:bold; background:white;'>❌ 損切り</p>", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
 
-                sim_result, _ = simulate_trade(df, used_time_utc, trade_type, price_now, tp_price, sl_price)
+            st.caption(f"※ ライン計算基準: ATR={res['atr_val']:{res['p_fmt']}} / RR比=1:{res['risk_reward_ratio']}")
 
-                col_tp, col_entry, col_sl = st.columns(3)
-                
-                tp_bg = "background-color:#d4edda;" if sim_result == "WIN" else ""
-                sl_bg = "background-color:#f8d7da;" if sim_result == "LOSS" else ""
-                
-                with col_tp:
-                    st.markdown(f"<div style='{tp_bg} padding:10px; border-radius:10px; border:1px solid #ddd;'>", unsafe_allow_html=True)
-                    st.markdown(f"<h3 style='color:{tp_color}; text-align: center;'>🎯 利確 (TP)</h3>", unsafe_allow_html=True)
-                    st.markdown(f"<h2 style='text-align: center;'>{tp_price:{p_fmt}}</h2>", unsafe_allow_html=True)
-                    st.markdown(f"<p style='text-align: center;'>予定利益: <b>+{est_profit:,.0f} {currency_label}</b></p>", unsafe_allow_html=True)
-                    if sim_result == "WIN": st.markdown(f"<p style='text-align: center; color:green; font-weight:bold; background:white;'>✅ 達成</p>", unsafe_allow_html=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                    
-                with col_entry:
-                    st.markdown(f"<h3 style='text-align: center;'>Entry</h3>", unsafe_allow_html=True)
-                    st.markdown(f"<h2 style='text-align: center;'>{price_now:{p_fmt}}</h2>", unsafe_allow_html=True)
-                    st.markdown(f"<div style='text-align: center; font-weight:bold; padding:5px; background-color:#333; color:white; border-radius:5px;'>{trade_type}</div>", unsafe_allow_html=True)
-                    if conversion_note:
-                        st.caption(f"※{conversion_note}")
+            st.markdown("---")
+            st.subheader("🧠 なぜこの予測になったのか？")
+            res['fi_df']['Importance'] = res['fi_df']['Importance'] / res['fi_df']['Importance'].sum()
+            st.bar_chart(res['fi_df'].set_index('Feature'))
+            
+            st.markdown("---")
+            col_up, col_down = st.columns(2)
+            with col_up:
+                st.write(f"📈 上昇確率: {res['up_prob']:.1f}%")
+                st.progress(int(res['up_prob']))
+            with col_down:
+                st.write(f"📉 下落確率: {res['down_prob']:.1f}%")
+                st.progress(int(res['down_prob']))
 
-                with col_sl:
-                    st.markdown(f"<div style='{sl_bg} padding:10px; border-radius:10px; border:1px solid #ddd;'>", unsafe_allow_html=True)
-                    st.markdown(f"<h3 style='color:{sl_color}; text-align: center;'>🛑 損切り (SL)</h3>", unsafe_allow_html=True)
-                    st.markdown(f"<h2 style='text-align: center;'>{sl_price:{p_fmt}}</h2>", unsafe_allow_html=True)
-                    st.markdown(f"<p style='text-align: center;'>予定損失: <b>-{est_loss:,.0f} {currency_label}</b></p>", unsafe_allow_html=True)
-                    if sim_result == "LOSS": st.markdown(f"<p style='text-align: center; color:red; font-weight:bold; background:white;'>❌ 損切り</p>", unsafe_allow_html=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-
-                st.caption(f"※ ライン計算基準: ATR={atr_val:{p_fmt}} / RR比=1:{risk_reward_ratio}")
-
-                # --- 根拠の可視化 ---
-                st.markdown("---")
-                st.subheader("🧠 なぜこの予測になったのか？")
-                fi_df['Importance'] = fi_df['Importance'] / fi_df['Importance'].sum()
-                st.bar_chart(fi_df.set_index('Feature'))
-                
-                # --- チャートと確率 ---
-                st.markdown("---")
-                col_up, col_down = st.columns(2)
-                with col_up:
-                    st.write(f"📈 上昇確率: {up_prob:.1f}%")
-                    st.progress(int(up_prob))
-                with col_down:
-                    st.write(f"📉 下落確率: {down_prob:.1f}%")
-                    st.progress(int(down_prob))
-
-                chart_df = df.copy()
-                chart_df.index = chart_df.index.tz_convert(jst)
-                plot_start = target_dt_jst - timedelta(hours=24)
-                plot_end = target_dt_jst + timedelta(hours=6)
-                st.line_chart(chart_df.loc[plot_start:plot_end]['Close'])
+            chart_df = res['df'].copy()
+            chart_df.index = chart_df.index.tz_convert(jst)
+            plot_start = target_dt_jst - timedelta(hours=24)
+            plot_end = target_dt_jst + timedelta(hours=6)
+            st.line_chart(chart_df.loc[plot_start:plot_end]['Close'])
