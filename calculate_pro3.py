@@ -29,31 +29,27 @@ def calculate_technical_indicators(df):
     df['SMA_5'] = df['Close'].rolling(window=5).mean()
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     
-    # ボリンジャーバンド
     df['BB_upper'] = df['SMA_20'] + 2 * df['Close'].rolling(window=20).std()
     df['BB_lower'] = df['SMA_20'] - 2 * df['Close'].rolling(window=20).std()
     
-    # RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # モメンタム
     df['Momentum'] = df['Close'] - df['Close'].shift(10)
 
-    # --- 追加: MACD ---
+    # --- MACD ---
     exp12 = df['Close'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['Signal']
 
-    # --- 追加: Slope ---
     df['SMA_20_Slope'] = df['SMA_20'].diff()
 
-    # --- 追加: ATR ---
+    # --- ATR ---
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
@@ -61,7 +57,20 @@ def calculate_technical_indicators(df):
     true_range = ranges.max(axis=1)
     df['ATR'] = true_range.rolling(window=14).mean()
     
-    # --- 追加: Lag Features ---
+    # --- ADX ---
+    df['UpMove'] = df['High'] - df['High'].shift(1)
+    df['DownMove'] = df['Low'].shift(1) - df['Low']
+    df['+DM'] = np.where((df['UpMove'] > df['DownMove']) & (df['UpMove'] > 0), df['UpMove'], 0.0)
+    df['-DM'] = np.where((df['DownMove'] > df['UpMove']) & (df['DownMove'] > 0), df['DownMove'], 0.0)
+    
+    safe_atr = df['ATR'].replace(0, np.nan)
+    df['+DI'] = 100 * (pd.Series(df['+DM']).ewm(alpha=1/14, adjust=False).mean() / safe_atr)
+    df['-DI'] = 100 * (pd.Series(df['-DM']).ewm(alpha=1/14, adjust=False).mean() / safe_atr)
+    di_sum = df['+DI'] + df['-DI']
+    df['DX'] = 100 * np.abs(df['+DI'] - df['-DI']) / di_sum.replace(0, np.nan)
+    df['ADX'] = df['DX'].ewm(alpha=1/14, adjust=False).mean()
+    
+    # --- Lag Features ---
     df['RSI_Lag1'] = df['RSI'].shift(1)
     df['Close_Pct_Change'] = df['Close'].pct_change()
     df['Close_Pct_Lag1'] = df['Close_Pct_Change'].shift(1)
@@ -69,8 +78,8 @@ def calculate_technical_indicators(df):
     df.dropna(inplace=True)
     return df
 
-def fetch_and_process_data(ticker, target_dt_jst):
-    """データを取得し、UTC変換して処理"""
+def fetch_and_process_data(ticker, target_dt_jst, prediction_hours=6):
+    """データを取得し、UTC変換して処理 (予測時間幅を動的に変更可能に)"""
     target_dt_utc = target_dt_jst.astimezone(pytz.utc)
     
     start_date = target_dt_utc - timedelta(days=60)
@@ -96,12 +105,14 @@ def fetch_and_process_data(ticker, target_dt_jst):
 
     df_1h = calculate_technical_indicators(df_1h)
     
-    df_1h['Target_Price_6h'] = df_1h['Close'].shift(-6)
-    df_1h['Target'] = (df_1h['Target_Price_6h'] > df_1h['Close']).astype(int)
+    # 予測時間幅に基づいてターゲットを作成
+    target_col_name = f'Target_Price_{prediction_hours}h'
+    df_1h[target_col_name] = df_1h['Close'].shift(-prediction_hours)
+    df_1h['Target'] = (df_1h[target_col_name] > df_1h['Close']).astype(int)
     
     return df_1h, target_dt_utc, target_dt_jst
 
-def train_and_predict(df, target_dt_utc):
+def train_and_predict(df, target_dt_utc, prediction_hours=6):
     """学習と予測を実行"""
     
     train_data = df[df.index < target_dt_utc].dropna().copy()
@@ -124,14 +135,13 @@ def train_and_predict(df, target_dt_utc):
 
     features = [
         'Close', 'SMA_5', 'SMA_20', 'RSI', 'BB_upper', 'BB_lower', 'Momentum',
-        'MACD', 'Signal', 'MACD_Hist', 'SMA_20_Slope', 'RSI_Lag1', 'Close_Pct_Lag1'
+        'MACD', 'Signal', 'MACD_Hist', 'SMA_20_Slope', 'ADX', 'RSI_Lag1', 'Close_Pct_Lag1'
     ]
     
     X_train = train_data[features]
     y_train = train_data['Target']
     X_target = prediction_row[features]
 
-    # モデル構築
     model = RandomForestClassifier(n_estimators=200, max_depth=12, min_samples_split=5, random_state=42)
     model.fit(X_train, y_train)
 
@@ -144,15 +154,18 @@ def train_and_predict(df, target_dt_utc):
     }).sort_values(by='Importance', ascending=False)
     
     current_price = prediction_row['Close'].values[0]
-    future_price = prediction_row['Target_Price_6h'].values[0]
+    target_col_name = f'Target_Price_{prediction_hours}h'
+    future_price = prediction_row[target_col_name].values[0]
     atr_val = prediction_row['ATR'].values[0]
+    adx_val = prediction_row['ADX'].values[0]
     used_time_utc = prediction_row.index[0]
     
-    return proba, current_price, future_price, used_time_utc, atr_val, feature_importance_df
+    return proba, current_price, future_price, used_time_utc, atr_val, feature_importance_df, adx_val
 
-def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_price):
+def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_price, prediction_hours=6):
     """トレード結果シミュレーション"""
-    future_candles = df[df.index > start_time_utc].head(6)
+    # 予測時間幅に基づいてチェックする足の数を調整
+    future_candles = df[df.index > start_time_utc].head(prediction_hours)
     
     if future_candles.empty or len(future_candles) < 1:
         return "NO_DATA", None
@@ -185,6 +198,100 @@ def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_pri
                 
     return hit_result, hit_price
 
+# --- 新機能: 最強設定の探索 (時間幅対応) ---
+@st.cache_data(show_spinner=False, ttl=3600)
+def find_best_settings_last_week():
+    """過去1週間のデータを使って全通貨ペア・設定・時間幅のバックテストを行う"""
+    tickers_map = {
+        "USDJPY": "USDJPY=X",
+        "EURUSD": "EURUSD=X",
+        "GBPUSD": "GBPUSD=X",
+        "XAUUSD (金)": "GC=F",
+        "BTCUSD (ビットコイン)": "BTC-USD",
+        "ETHUSD (イーサリアム)": "ETH-USD",
+        "XAGUSD (銀)": "SI=F"
+    }
+    
+    # 探索するパラメータの組み合わせ
+    rr_grid = [1.0, 1.5, 2.0, 3.0]
+    sl_grid = [1.0, 1.5, 2.0]
+    hours_grid = [1, 3, 6, 12, 24] # 探索する時間幅のバリエーション
+    
+    best_r = -float('inf')
+    best_combo = None
+    
+    now_utc = datetime.now(pytz.utc)
+    test_start = now_utc - timedelta(days=7)
+    
+    for name, ticker in tickers_map.items():
+        start_date = test_start - timedelta(days=60)
+        try:
+            df = yf.download(ticker, start=start_date, end=now_utc + timedelta(days=1), interval="1h", progress=False)
+            if df.empty: continue
+            if df.index.tz is None: df.index = df.index.tz_localize('UTC')
+            else: df.index = df.index.tz_convert('UTC')
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            
+            df = calculate_technical_indicators(df)
+            
+            for h in hours_grid:
+                df_temp = df.copy()
+                target_col = f'Target_Price_{h}h'
+                df_temp[target_col] = df_temp['Close'].shift(-h)
+                df_temp['Target'] = (df_temp[target_col] > df_temp['Close']).astype(int)
+                
+                train_df = df_temp[df_temp.index < test_start].dropna()
+                test_df = df_temp[(df_temp.index >= test_start) & (df_temp.index <= now_utc - timedelta(hours=h))]
+                
+                if len(train_df) < 50 or len(test_df) < 1: continue
+                
+                features = ['Close', 'SMA_5', 'SMA_20', 'RSI', 'BB_upper', 'BB_lower', 'Momentum', 'MACD', 'Signal', 'MACD_Hist', 'SMA_20_Slope', 'ADX', 'RSI_Lag1', 'Close_Pct_Lag1']
+                X_train = train_df[features]
+                y_train = train_df['Target']
+                
+                model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+                model.fit(X_train, y_train)
+                
+                preds = model.predict_proba(test_df[features])
+                
+                for rr in rr_grid:
+                    for sl in sl_grid:
+                        total_r = 0 
+                        for i in range(len(test_df)):
+                            row = test_df.iloc[i]
+                            prob_down, prob_up = preds[i]
+                            direction = "BUY" if prob_up > prob_down else "SELL"
+                            
+                            atr = row['ATR']
+                            price_now = row['Close']
+                            sl_dist = atr * sl
+                            tp_dist = sl_dist * rr
+                            
+                            tp_price = price_now + tp_dist if direction == "BUY" else price_now - tp_dist
+                            sl_price = price_now - sl_dist if direction == "BUY" else price_now + sl_dist
+                            
+                            res, _ = simulate_trade(df_temp, test_df.index[i], direction, price_now, tp_price, sl_price, prediction_hours=h)
+                            
+                            if res == "WIN":
+                                total_r += rr
+                            elif res == "LOSS":
+                                total_r -= 1.0
+                                
+                        if total_r > best_r:
+                            best_r = total_r
+                            best_combo = {
+                                "asset": name,
+                                "hours": h,
+                                "rr": rr,
+                                "sl": sl,
+                                "r_profit": total_r,
+                                "total_trades": len(test_df)
+                            }
+        except:
+            pass
+            
+    return best_combo
+
 # ---------------------------------------------------------
 # 2. Streamlit UI
 # ---------------------------------------------------------
@@ -195,7 +302,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("💹 AI FX 6時間後トレンド予測ツール")
+st.title("💹 AI FX トレンド予測ツール")
 
 # --- サイドバー設定 ---
 st.sidebar.header("設定")
@@ -206,7 +313,32 @@ if 'init_done' not in st.session_state:
     st.session_state.default_time = time(now.hour, 0)
     st.session_state.init_done = True
 
+# --- 最強設定の自動探索 ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🏆 過去1週間の最強設定を探索")
+st.sidebar.caption("直近1週間で最もAIが機能した通貨ペア・時間幅・設定を提案します。")
+
+if st.sidebar.button("🔍 自動探索スタート"):
+    with st.spinner("AIが全通貨ペアのバックテストを実行中... (約10〜30秒)"):
+        best = find_best_settings_last_week()
+        if best and best['r_profit'] > 0:
+            fixed_risk_jpy = 10000
+            est_profit_jpy = best['r_profit'] * fixed_risk_jpy
+            st.sidebar.success(f"**【最強設定が判明しました】**\n\n"
+                               f"👑 通貨ペア: **{best['asset']}**\n\n"
+                               f"⏳ 予測時間幅: **{best['hours']}時間**\n\n"
+                               f"⚖️ RR比率: **{best['rr']}**\n\n"
+                               f"🛑 損切り(ATR): **{best['sl']}**\n\n"
+                               f"💰 1回の損切りを1万円に固定した場合の週間利益:\n"
+                               f"**+{est_profit_jpy:,.0f}円**\n\n"
+                               f"<small>※バックテスト回数: {best['total_trades']}回</small>")
+        elif best:
+            st.sidebar.warning("過去1週間はどの設定でもマイナス、または十分なデータが得られませんでした。相場が荒れている可能性があります。")
+        else:
+            st.sidebar.error("データ取得に失敗しました。")
+
 # --- 通貨ペア設定 ---
+st.sidebar.markdown("---")
 st.sidebar.subheader("通貨ペア設定")
 ticker1 = st.sidebar.text_input("通貨ペア 1", "USDJPY=X")
 
@@ -216,8 +348,9 @@ if use_second_ticker:
 else:
     ticker2 = None
 
+# --- 日時・予測設定 (変更箇所: 時間幅の追加) ---
 st.sidebar.markdown("---")
-st.sidebar.subheader("日時設定")
+st.sidebar.subheader("日時・予測設定")
 use_realtime = st.sidebar.checkbox("🔴 リアルタイム予測 (現在時刻)", value=False)
 
 if use_realtime:
@@ -228,7 +361,9 @@ else:
     input_date = st.sidebar.date_input("日付", value=st.session_state.default_date)
     input_time = st.sidebar.time_input("時間 (JST)", value=st.session_state.default_time)
 
-# --- 資金・リスク管理 (各通貨ペアごとに独立設定) ---
+prediction_hours = st.sidebar.slider("予測時間幅 (時間)", min_value=1, max_value=24, value=6, step=1, help="予測する対象の未来の時間を指定します。")
+
+# --- 資金・リスク管理 ---
 st.sidebar.markdown("---")
 st.sidebar.subheader(f"資金・リスク管理 (1つ目: {ticker1})")
 
@@ -263,10 +398,10 @@ st.sidebar.markdown("---")
 
 if st.sidebar.button("予測を実行"):
     st.caption(f"基準日時 (JST): {target_dt_jst.strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"予測時間幅: {prediction_hours}時間")
     if use_realtime:
         st.markdown("**🔴 リアルタイム・モード** で実行中")
         
-    # 分析対象のリストを作成し、それぞれのリスク管理設定を保持
     tickers_to_process = [
         {'tk': ticker1, 'units': trade_units_1, 'rr': risk_reward_ratio_1, 'sl_atr': sl_atr_multiplier_1}
     ]
@@ -281,7 +416,6 @@ if st.sidebar.button("予測を実行"):
     total_est_loss = 0
     is_future_global = False
 
-    # 各通貨ごとに処理ループ
     for item in tickers_to_process:
         tk = item['tk']
         trade_units = item['units']
@@ -289,13 +423,13 @@ if st.sidebar.button("予測を実行"):
         sl_atr_multiplier = item['sl_atr']
         
         with st.spinner(f'{tk} のデータを取得・AI解析中...'):
-            df, target_dt_utc, _ = fetch_and_process_data(tk, target_dt_jst)
+            df, target_dt_utc, _ = fetch_and_process_data(tk, target_dt_jst, prediction_hours=prediction_hours)
             
             if df is not None:
-                result = train_and_predict(df, target_dt_utc)
+                result = train_and_predict(df, target_dt_utc, prediction_hours=prediction_hours)
                 
                 if result:
-                    proba, price_now, price_6h, used_time_utc, atr_val, fi_df = result
+                    proba, price_now, price_6h, used_time_utc, atr_val, fi_df, adx_val = result
                     
                     used_time_jst = used_time_utc.astimezone(jst)
                     down_prob = proba[0] * 100
@@ -315,13 +449,13 @@ if st.sidebar.button("予測を実行"):
                     p_fmt = ".3f" if "JPY" in tk else ".5f"
 
                     is_future = np.isnan(price_6h)
-                    is_future_global = is_future # 両方とも未来か過去かは同じはずなので保持
+                    is_future_global = is_future
                     diff = 0 if is_future else price_6h - price_now
                     
                     ai_direction = "UP ↗️" if up_prob > down_prob else "DOWN ↘️"
                     ai_confidence = max(up_prob, down_prob)
                     
-                    # 損益計算 (日本円対応)
+                    # 損益計算
                     final_profit = 0
                     if not is_future:
                         raw_profit = (price_6h - price_now) * trade_units if up_prob > down_prob else (price_now - price_6h) * trade_units
@@ -346,14 +480,12 @@ if st.sidebar.button("予測を実行"):
                     est_profit = (tp_distance * trade_units) * usdjpy_rate
                     est_loss = (sl_distance * trade_units) * usdjpy_rate
 
-                    sim_result, _ = simulate_trade(df, used_time_utc, trade_type, price_now, tp_price, sl_price)
+                    sim_result, _ = simulate_trade(df, used_time_utc, trade_type, price_now, tp_price, sl_price, prediction_hours=prediction_hours)
 
-                    # 合計用に加算
                     total_final_profit += final_profit
                     total_est_profit += est_profit
                     total_est_loss += est_loss
 
-                    # 結果をリストに保存
                     analysis_results.append({
                         'tk': tk, 'trade_units': trade_units, 'risk_reward_ratio': risk_reward_ratio, 
                         'df': df, 'price_now': price_now, 'price_6h': price_6h,
@@ -364,7 +496,8 @@ if st.sidebar.button("予測を実行"):
                         'final_profit': final_profit, 'sl_distance': sl_distance, 'tp_distance': tp_distance,
                         'trade_type': trade_type, 'tp_price': tp_price, 'sl_price': sl_price,
                         'sl_color': sl_color, 'tp_color': tp_color, 'est_profit': est_profit,
-                        'est_loss': est_loss, 'sim_result': sim_result, 'atr_val': atr_val, 'fi_df': fi_df
+                        'est_loss': est_loss, 'sim_result': sim_result, 'atr_val': atr_val, 'fi_df': fi_df,
+                        'adx_val': adx_val
                     })
 
     # ==========================================
@@ -372,7 +505,6 @@ if st.sidebar.button("予測を実行"):
     # ==========================================
     if len(analysis_results) > 0:
         
-        # --- 総合結果表示 (2通貨ペアの場合のみ表示) ---
         if len(analysis_results) > 1:
             st.markdown("---")
             st.markdown("## 🌐 総合シミュレーション結果 (2通貨ペア合計)")
@@ -396,22 +528,41 @@ if st.sidebar.button("予測を実行"):
                 </div>
                 """, unsafe_allow_html=True)
 
-        # --- 各通貨ペアの詳細表示ループ ---
         for res in analysis_results:
             st.markdown("---")
             st.markdown(f"## 📌 詳細分析: {res['tk']}")
             
+            adx = res['adx_val']
+            regime_text = ""
+            regime_color = ""
+            regime_desc = ""
+            
+            if adx < 25:
+                regime_text = "レンジ相場 (Range)"
+                regime_color = "#f39c12"
+                regime_desc = "⚠️ 現在は明確なトレンドがありません。AIは順張り傾向があるため、ダマシに遭う確率が高くなります。シグナルの確信度が低い場合は見送りを検討してください。"
+            else:
+                regime_text = "トレンド相場 (Trend)"
+                regime_color = "#27ae60"
+                regime_desc = "✅ 明確なトレンドが発生しています。AIの順張り予測が機能しやすい環境です。"
+
+            st.markdown(f"""
+            <div style="border-left: 5px solid {regime_color}; padding: 10px; background-color: #f9f9f9; margin-bottom: 20px;">
+                <h4 style="margin: 0; color: {regime_color};">🧭 相場環境認識: {regime_text}</h4>
+                <p style="margin: 5px 0 0 0; font-size: 14px;">(ADX値: {adx:.1f}) {regime_desc}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
             st.subheader("📊 予測結果と損益シミュレーション")
             
             kpi1, kpi2, kpi3 = st.columns(3)
-
             kpi1.metric(label="🏁 開始価格", value=f"{res['price_now']:{res['p_fmt']}}")
 
             if res['is_future']:
-                kpi2.metric(label="🏁 6時間後の価格", value="未確定 (未来)", delta="Waiting...")
+                kpi2.metric(label=f"🏁 {prediction_hours}時間後の価格", value="未確定 (未来)", delta="Waiting...")
             else:
                 kpi2.metric(
-                    label="🏁 6時間後の価格 (実際)",
+                    label=f"🏁 {prediction_hours}時間後の価格 (実際)",
                     value=f"{res['price_6h']:{res['p_fmt']}}",
                     delta=f"{res['diff']:{res['p_fmt']}}",
                     delta_color="inverse" if "JPY" in res['tk'] and res['diff'] < 0 else "normal"
@@ -485,5 +636,5 @@ if st.sidebar.button("予測を実行"):
             chart_df = res['df'].copy()
             chart_df.index = chart_df.index.tz_convert(jst)
             plot_start = target_dt_jst - timedelta(hours=24)
-            plot_end = target_dt_jst + timedelta(hours=6)
+            plot_end = target_dt_jst + timedelta(hours=prediction_hours)
             st.line_chart(chart_df.loc[plot_start:plot_end]['Close'])
