@@ -79,7 +79,7 @@ def calculate_technical_indicators(df):
     return df
 
 def fetch_and_process_data(ticker, target_dt_jst, prediction_hours=6):
-    """データを取得し、UTC変換して処理 (予測時間幅を動的に変更可能に)"""
+    """データを取得し、UTC変換して処理"""
     target_dt_utc = target_dt_jst.astimezone(pytz.utc)
     
     start_date = target_dt_utc - timedelta(days=60)
@@ -105,7 +105,6 @@ def fetch_and_process_data(ticker, target_dt_jst, prediction_hours=6):
 
     df_1h = calculate_technical_indicators(df_1h)
     
-    # 予測時間幅に基づいてターゲットを作成
     target_col_name = f'Target_Price_{prediction_hours}h'
     df_1h[target_col_name] = df_1h['Close'].shift(-prediction_hours)
     df_1h['Target'] = (df_1h[target_col_name] > df_1h['Close']).astype(int)
@@ -163,17 +162,17 @@ def train_and_predict(df, target_dt_utc, prediction_hours=6):
     return proba, current_price, future_price, used_time_utc, atr_val, feature_importance_df, adx_val
 
 def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_price, prediction_hours=6):
-    """トレード結果シミュレーション"""
-    # 予測時間幅に基づいてチェックする足の数を調整
+    """トレード結果シミュレーション (決済された時間も返す)"""
     future_candles = df[df.index > start_time_utc].head(prediction_hours)
     
     if future_candles.empty or len(future_candles) < 1:
-        return "NO_DATA", None
+        return "NO_DATA", None, None
     
     hit_result = "DRAW"
     hit_price = future_candles.iloc[-1]['Close']
+    close_time = future_candles.index[-1] # 時間切れの場合は最後の足の時間
     
-    for i, row in future_candles.iterrows():
+    for close_idx, row in future_candles.iterrows():
         high = row['High']
         low = row['Low']
         
@@ -181,24 +180,28 @@ def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_pri
             if low <= sl_price:
                 hit_result = "LOSS"
                 hit_price = sl_price
+                close_time = close_idx
                 break
             elif high >= tp_price:
                 hit_result = "WIN"
                 hit_price = tp_price
+                close_time = close_idx
                 break
         elif trade_type == "SELL":
             if high >= sl_price:
                 hit_result = "LOSS"
                 hit_price = sl_price
+                close_time = close_idx
                 break
             elif low <= tp_price:
                 hit_result = "WIN"
                 hit_price = tp_price
+                close_time = close_idx
                 break
                 
-    return hit_result, hit_price
+    return hit_result, hit_price, close_time
 
-# --- 新機能: 最強設定の探索 (時間幅対応) ---
+# --- 最強設定の探索 (取引量と取引履歴の計算を追加) ---
 @st.cache_data(show_spinner=False, ttl=3600)
 def find_best_settings_last_week():
     """過去1週間のデータを使って全通貨ペア・設定・時間幅のバックテストを行う"""
@@ -212,10 +215,12 @@ def find_best_settings_last_week():
         "XAGUSD (銀)": "SI=F"
     }
     
-    # 探索するパラメータの組み合わせ
+    # 損切り1万円計算用に最新のドル円レートを取得
+    usdjpy_rate_cache = get_usdjpy_rate() 
+    
     rr_grid = [1.0, 1.5, 2.0, 3.0]
     sl_grid = [1.0, 1.5, 2.0]
-    hours_grid = [1, 3, 6, 12, 24] # 探索する時間幅のバリエーション
+    hours_grid = [1, 2, 3, 4, 5, 6] 
     
     best_r = -float('inf')
     best_combo = None
@@ -257,7 +262,17 @@ def find_best_settings_last_week():
                 for rr in rr_grid:
                     for sl in sl_grid:
                         total_r = 0 
+                        total_trades_count = 0
+                        total_units_needed = 0 
+                        next_available_time = None 
+                        temp_history = [] # 取引履歴（R倍数）を記録するリスト
+                        
                         for i in range(len(test_df)):
+                            current_time = test_df.index[i]
+                            
+                            if next_available_time is not None and current_time <= next_available_time:
+                                continue
+                                
                             row = test_df.iloc[i]
                             prob_down, prob_up = preds[i]
                             direction = "BUY" if prob_up > prob_down else "SELL"
@@ -270,22 +285,47 @@ def find_best_settings_last_week():
                             tp_price = price_now + tp_dist if direction == "BUY" else price_now - tp_dist
                             sl_price = price_now - sl_dist if direction == "BUY" else price_now + sl_dist
                             
-                            res, _ = simulate_trade(df_temp, test_df.index[i], direction, price_now, tp_price, sl_price, prediction_hours=h)
+                            res, _, close_time = simulate_trade(df_temp, current_time, direction, price_now, tp_price, sl_price, prediction_hours=h)
                             
-                            if res == "WIN":
-                                total_r += rr
-                            elif res == "LOSS":
-                                total_r -= 1.0
+                            if res != "NO_DATA":
+                                total_trades_count += 1
+                                if close_time is not None:
+                                    next_available_time = close_time 
+                                
+                                # 損切り1万円固定に必要な取引量(ロット数)を計算
+                                if sl_dist > 0:
+                                    if "JPY" in ticker:
+                                        units_req = 10000 / sl_dist
+                                    elif "USD" in ticker:
+                                        units_req = 10000 / (sl_dist * usdjpy_rate_cache)
+                                    else:
+                                        units_req = 0
+                                else:
+                                    units_req = 0
+                                total_units_needed += units_req
+                                
+                                # 結果をR倍数で履歴に保存
+                                if res == "WIN":
+                                    total_r += rr
+                                    temp_history.append(rr)
+                                elif res == "LOSS":
+                                    total_r -= 1.0
+                                    temp_history.append(-1.0)
+                                else:
+                                    temp_history.append(0.0) # 時間切れ引き分け
                                 
                         if total_r > best_r:
                             best_r = total_r
+                            avg_units = total_units_needed / total_trades_count if total_trades_count > 0 else 0
                             best_combo = {
                                 "asset": name,
                                 "hours": h,
                                 "rr": rr,
                                 "sl": sl,
                                 "r_profit": total_r,
-                                "total_trades": len(test_df)
+                                "total_trades": total_trades_count,
+                                "avg_units": avg_units,
+                                "trade_history": temp_history.copy() # 履歴データを保存
                             }
         except:
             pass
@@ -329,9 +369,27 @@ if st.sidebar.button("🔍 自動探索スタート"):
                                f"⏳ 予測時間幅: **{best['hours']}時間**\n\n"
                                f"⚖️ RR比率: **{best['rr']}**\n\n"
                                f"🛑 損切り(ATR): **{best['sl']}**\n\n"
+                               f"📊 平均取引量(目安): **約{best['avg_units']:,.2f} 通貨**\n\n"
                                f"💰 1回の損切りを1万円に固定した場合の週間利益:\n"
                                f"**+{est_profit_jpy:,.0f}円**\n\n"
-                               f"<small>※バックテスト回数: {best['total_trades']}回</small>")
+                               f"※バックテスト回数: {best['total_trades']}回")
+            
+            # --- 損益グラフの描画 ---
+            st.sidebar.markdown("### 📈 バックテストの損益推移")
+            
+            # 利益を日本円（1万円固定リスク）に換算
+            history_jpy = [r * fixed_risk_jpy for r in best['trade_history']]
+            
+            history_df = pd.DataFrame({"損益 (円)": history_jpy})
+            history_df.index = history_df.index + 1 # トレード回数を1回目から表示
+            history_df['累積損益 (円)'] = history_df['損益 (円)'].cumsum()
+
+            st.sidebar.caption("各トレードごとの損益 (棒グラフ)")
+            st.sidebar.bar_chart(history_df['損益 (円)'])
+            
+            st.sidebar.caption("資産の推移 (折れ線グラフ)")
+            st.sidebar.line_chart(history_df['累積損益 (円)'])
+
         elif best:
             st.sidebar.warning("過去1週間はどの設定でもマイナス、または十分なデータが得られませんでした。相場が荒れている可能性があります。")
         else:
@@ -348,7 +406,7 @@ if use_second_ticker:
 else:
     ticker2 = None
 
-# --- 日時・予測設定 (変更箇所: 時間幅の追加) ---
+# --- 日時・予測設定 ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("日時・予測設定")
 use_realtime = st.sidebar.checkbox("🔴 リアルタイム予測 (現在時刻)", value=False)
@@ -361,7 +419,7 @@ else:
     input_date = st.sidebar.date_input("日付", value=st.session_state.default_date)
     input_time = st.sidebar.time_input("時間 (JST)", value=st.session_state.default_time)
 
-prediction_hours = st.sidebar.slider("予測時間幅 (時間)", min_value=1, max_value=24, value=6, step=1, help="予測する対象の未来の時間を指定します。")
+prediction_hours = st.sidebar.slider("予測時間幅 (時間)", min_value=1, max_value=6, value=6, step=1, help="予測する対象の未来の時間を指定します。(最大6時間)")
 
 # --- 資金・リスク管理 ---
 st.sidebar.markdown("---")
@@ -480,7 +538,7 @@ if st.sidebar.button("予測を実行"):
                     est_profit = (tp_distance * trade_units) * usdjpy_rate
                     est_loss = (sl_distance * trade_units) * usdjpy_rate
 
-                    sim_result, _ = simulate_trade(df, used_time_utc, trade_type, price_now, tp_price, sl_price, prediction_hours=prediction_hours)
+                    sim_result, _, _ = simulate_trade(df, used_time_utc, trade_type, price_now, tp_price, sl_price, prediction_hours=prediction_hours)
 
                     total_final_profit += final_profit
                     total_est_profit += est_profit
