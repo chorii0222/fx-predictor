@@ -95,7 +95,10 @@ def fetch_and_resample_data(ticker, timeframe, duration_days):
         if df_1h.empty: return None
         
         logic = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
-        resample_rule = "6H" if timeframe == "6h" else "12H"
+        
+        # ⚠️ 【修正箇所】pandas最新版の仕様に合わせ、大文字の H を小文字の h に変更
+        resample_rule = "6h" if timeframe == "6h" else "12h"
+        
         df = df_1h.resample(resample_rule).apply(logic).dropna()
         
     if df.empty: return None
