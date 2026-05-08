@@ -176,7 +176,7 @@ def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_pri
                 
     return hit_result, hit_price, close_time, entry_price
 
-# --- 最強設定探索 (期間・時間足対応版) ---
+# --- 最強設定探索 (期間・時間足・JST対応版) ---
 @st.cache_data(show_spinner=False, ttl=3600)
 def find_best_settings_dynamic(timeframe, duration_key):
     duration_map = {"1日": 1, "1週間": 7, "1ヶ月": 30, "1年": 365}
@@ -186,6 +186,9 @@ def find_best_settings_dynamic(timeframe, duration_key):
     best_r = -float('inf')
     best_combo = None
     usdjpy_rate = get_usdjpy_rate()
+    
+    # ⚠️ ログ表示用に日本時間のタイムゾーンを設定
+    jst = pytz.timezone('Asia/Tokyo')
     
     for tk in tickers:
         df = fetch_and_resample_data(tk, timeframe, days)
@@ -232,10 +235,13 @@ def find_best_settings_dynamic(timeframe, duration_key):
                         total_r += r_score
                         next_entry = exit_t
                         
-                        # ログ追加
+                        # ⚠️ ログを記録する際にUTCからJSTへ変換
+                        entry_time_jst = curr_time.astimezone(jst).strftime('%m/%d %H:%M')
+                        exit_time_jst = exit_t.astimezone(jst).strftime('%m/%d %H:%M')
+                        
                         trade_logs.append({
-                            "通貨": tk, "種別": direction, "Entry時間": curr_time.strftime('%m/%d %H:%M'),
-                            "Exit時間": exit_t.strftime('%m/%d %H:%M'), "Entry価格": f"{entry_p:.5f}",
+                            "通貨": tk, "種別": direction, "Entry時間 (JST)": entry_time_jst,
+                            "Exit時間 (JST)": exit_time_jst, "Entry価格": f"{entry_p:.5f}",
                             "Exit価格": f"{exit_p:.5f}", "結果": res, "Rスコア": r_score
                         })
                         
@@ -274,7 +280,6 @@ if st.sidebar.button("🏆 最強設定を自動探索"):
             fixed_risk_jpy = 10000
             est_profit_jpy = best['r_profit'] * fixed_risk_jpy
             
-            # --- 詳細な最強設定の表示を復活 ---
             st.sidebar.success(f"**【最強設定が判明しました】**\n\n"
                                f"👑 通貨ペア: **{best['asset']}**\n\n"
                                f"⏳ 使用時間足: **{tf_choice}** (予測本数: 6本)\n\n"
@@ -287,14 +292,12 @@ if st.sidebar.button("🏆 最強設定を自動探索"):
             
             st.session_state.best_logs = best['logs']
             
-            # --- 損益グラフと累積資産グラフの表示を復活 ---
             if len(best['logs']) > 0:
                 st.sidebar.markdown("### 📈 バックテストの損益推移")
                 
-                # ログからRスコアを取り出して日本円換算
                 history_jpy = [log['Rスコア'] * fixed_risk_jpy for log in best['logs']]
                 history_df = pd.DataFrame({"損益 (円)": history_jpy})
-                history_df.index = history_df.index + 1 # 回数を1からスタート
+                history_df.index = history_df.index + 1 
                 history_df['累積損益 (円)'] = history_df['損益 (円)'].cumsum()
 
                 st.sidebar.caption("各トレードごとの損益 (棒グラフ)")
@@ -328,7 +331,6 @@ if st.button("🚀 予測実行"):
             if res:
                 proba, price_now, atr, adx, fi, used_t = res
                 
-                # --- 相場環境 ---
                 regime = "トレンド" if adx > 25 else "レンジ"
                 st.info(f"🧭 現在の相場環境: **{regime}** (ADX: {adx:.1f}) | 足確定時刻: {used_t.astimezone(jst)}")
                 
@@ -336,7 +338,6 @@ if st.button("🚀 予測実行"):
                 col1.metric("開始価格", f"{price_now:.5f}")
                 col2.metric("AI予測", "UP ↗️" if proba[1]>proba[0] else "DOWN ↘️", f"確信度: {max(proba)*100:.1f}%")
                 
-                # --- シナリオ ---
                 sl_dist = atr * sl_input
                 tp_dist = sl_dist * rr_input
                 direction = "BUY" if proba[1]>proba[0] else "SELL"
@@ -350,10 +351,8 @@ if st.button("🚀 予測実行"):
                 c_ent.info(f"Entry: {price_now:.5f}")
                 c_sl.error(f"損切り: {sl_p:.5f}")
                 
-                # --- チャート ---
                 st.line_chart(df.tail(50)['Close'])
                 
-                # --- 重要度 ---
                 st.subheader("🧠 AIの判断根拠")
                 st.bar_chart(fi.set_index('Feature'))
 
