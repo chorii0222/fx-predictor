@@ -80,32 +80,34 @@ def fetch_and_resample_data(ticker, timeframe, duration_days):
     """
     指定された期間と時間足でデータを取得・リサンプルする
     """
-    # 取得期間の計算 (学習用にバッファを追加)
     end_date = datetime.now(pytz.utc) + timedelta(days=2)
     start_date = end_date - timedelta(days=duration_days + 60)
     
-    # yfinanceの標準インターバル
     yf_intervals = {"5m": "5m", "1h": "1h", "1d": "1d"}
     
-    if timeframe in yf_intervals:
-        df = yf.download(ticker, start=start_date, end=end_date, interval=yf_intervals[timeframe], progress=False)
-    else:
-        # 6h, 12hは1h足を取得してリサンプル
-        df_1h = yf.download(ticker, start=start_date, end=end_date, interval="1h", progress=False)
-        if df_1h.empty: return None
+    # yfinanceからデータを取得 (6hや12hの場合はまず1h足を取得)
+    interval_to_fetch = yf_intervals[timeframe] if timeframe in yf_intervals else "1h"
+    df = yf.download(ticker, start=start_date, end=end_date, interval=interval_to_fetch, progress=False)
         
-        logic = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
-        
-        # ⚠️ 【修正箇所】pandas最新版の仕様に合わせ、大文字の H を小文字の h に変更
-        resample_rule = "6h" if timeframe == "6h" else "12h"
-        
-        df = df_1h.resample(resample_rule).apply(logic).dropna()
-        
-    if df.empty: return None
+    if df is None or df.empty: 
+        return None
     
-    # マルチインデックス対応
+    # ⚠️ 【修正ポイント1】 マルチインデックス対応をリサンプルの「前」に行う
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+        
+    # 6h, 12hは1h足からリサンプル
+    if timeframe not in yf_intervals:
+        # ⚠️ 【修正ポイント2】 FXなどVolumeがないデータに対応
+        logic = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
+        if 'Volume' in df.columns:
+            logic['Volume'] = 'sum'
+            
+        resample_rule = "6h" if timeframe == "6h" else "12h"
+        df = df.resample(resample_rule).apply(logic).dropna()
+        
+    if df.empty: 
+        return None
         
     # タイムゾーン処理
     if df.index.tz is None:
@@ -239,7 +241,10 @@ def find_best_settings_dynamic(timeframe, duration_key):
                         })
                         
                         # 通貨単位計算
-                        u = 10000 / (sl_dist * (usdjpy_rate if "USD" in tk else 1.0))
+                        if sl_dist > 0:
+                            u = 10000 / (sl_dist * (usdjpy_rate if "USD" in tk else 1.0))
+                        else:
+                            u = 0
                         total_units += u
                 
                 if total_r > best_r:
