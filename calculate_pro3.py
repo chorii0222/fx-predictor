@@ -176,18 +176,22 @@ def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_pri
                 
     return hit_result, hit_price, close_time, entry_price
 
-# --- 最強設定探索 (期間・時間足・JST対応版) ---
+# --- 最強設定探索 (期間・時間足・JST対応 ＋ 特定通貨絞り込み対応) ---
 @st.cache_data(show_spinner=False, ttl=3600)
-def find_best_settings_dynamic(timeframe, duration_key):
+def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None):
     duration_map = {"1日": 1, "1週間": 7, "1ヶ月": 30, "1年": 365}
     days = duration_map[duration_key]
-    tickers = ["USDJPY=X", "EURUSD=X", "GBPUSD=X", "GC=F", "BTC-USD", "ETH-USD", "SI=F"]
+    
+    # --- 新機能: 探索対象の絞り込み ---
+    if specific_ticker:
+        tickers = [specific_ticker]
+    else:
+        tickers = ["USDJPY=X", "EURUSD=X", "GBPUSD=X", "GC=F", "BTC-USD", "ETH-USD", "SI=F"]
     
     best_r = -float('inf')
     best_combo = None
     usdjpy_rate = get_usdjpy_rate()
     
-    # ⚠️ ログ表示用に日本時間のタイムゾーンを設定
     jst = pytz.timezone('Asia/Tokyo')
     
     for tk in tickers:
@@ -235,7 +239,6 @@ def find_best_settings_dynamic(timeframe, duration_key):
                         total_r += r_score
                         next_entry = exit_t
                         
-                        # ⚠️ ログを記録する際にUTCからJSTへ変換
                         entry_time_jst = curr_time.astimezone(jst).strftime('%m/%d %H:%M')
                         exit_time_jst = exit_t.astimezone(jst).strftime('%m/%d %H:%M')
                         
@@ -245,7 +248,6 @@ def find_best_settings_dynamic(timeframe, duration_key):
                             "Exit価格": f"{exit_p:.5f}", "結果": res, "Rスコア": r_score
                         })
                         
-                        # 通貨単位計算
                         if sl_dist > 0:
                             u = 10000 / (sl_dist * (usdjpy_rate if "USD" in tk else 1.0))
                         else:
@@ -272,11 +274,20 @@ st.sidebar.header("🎛️ グローバル設定")
 tf_choice = st.sidebar.selectbox("使用する時間足", ["5m", "1h", "6h", "12h", "1d"], index=1)
 bt_duration = st.sidebar.selectbox("バックテスト期間", ["1日", "1週間", "1ヶ月", "1年"], index=1)
 
+# --- 新機能: 探索モード ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🏆 最強設定を自動探索")
+
+search_mode = st.sidebar.radio("探索対象", ["定番7通貨から探す", "特定の通貨を指定する"])
+search_ticker = None
+if search_mode == "特定の通貨を指定する":
+    search_ticker = st.sidebar.text_input("探索する通貨ペア (例: USDJPY=X)", "USDJPY=X", key="search_tk")
+
 if st.sidebar.button("🏆 最強設定を自動探索"):
-    with st.spinner("全通貨・全設定を総当たり検証中..."):
-        best = find_best_settings_dynamic(tf_choice, bt_duration)
+    msg = f"{search_ticker}のバックテストを実行中..." if search_ticker else "全通貨・全設定を総当たり検証中..."
+    with st.spinner(msg):
+        best = find_best_settings_dynamic(tf_choice, bt_duration, search_ticker)
         if best:
-            # 利益計算
             fixed_risk_jpy = 10000
             est_profit_jpy = best['r_profit'] * fixed_risk_jpy
             
@@ -307,7 +318,7 @@ if st.sidebar.button("🏆 最強設定を自動探索"):
                 st.sidebar.line_chart(history_df['累積損益 (円)'])
 
         else:
-            st.sidebar.warning("有効な設定が見つかりませんでした。")
+            st.sidebar.warning("有効な設定が見つかりませんでした。相場が荒れているか、データが不足しています。")
 
 st.sidebar.markdown("---")
 ticker1 = st.sidebar.text_input("分析通貨 1", "USDJPY=X")
