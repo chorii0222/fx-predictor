@@ -85,7 +85,7 @@ def fetch_and_resample_data(ticker, timeframe, duration_days):
     
     yf_intervals = {"5m": "5m", "1h": "1h", "1d": "1d"}
     
-    # yfinanceからデータを取得
+    # yfinanceからデータを取得 (2h, 3h, 4h, 5h, 6h, 12hの場合はまず1h足を取得)
     interval_to_fetch = yf_intervals[timeframe] if timeframe in yf_intervals else "1h"
     df = yf.download(ticker, start=start_date, end=end_date, interval=interval_to_fetch, progress=False)
         
@@ -96,12 +96,13 @@ def fetch_and_resample_data(ticker, timeframe, duration_days):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
         
-    # リサンプル処理
+    # 2h, 3h, 4h, 5h, 6h, 12hは1h足からリサンプル
     if timeframe not in yf_intervals:
         logic = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
         if 'Volume' in df.columns:
             logic['Volume'] = 'sum'
             
+        # timeframe ("2h", "3h", "4h", "5h", "6h", "12h") をそのままリサンプルのルールとして使用
         resample_rule = timeframe
         df = df.resample(resample_rule).apply(logic).dropna()
         
@@ -231,7 +232,6 @@ def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None):
                         res, exit_p, exit_t, entry_p = simulate_trade(df, curr_time, direction, row['Close'], tp_p, sl_p, h)
                         
                         if res != "NO_DATA":
-                            # ⚠️ 【修正箇所】DRAW時の正確な損益（Rスコア）の計算
                             if res == "WIN":
                                 r_score = rr
                             elif res == "LOSS":
@@ -278,7 +278,8 @@ st.title("💹 AI FX マルチタイムフレーム・トレーダー")
 
 # --- サイドバー ---
 st.sidebar.header("🎛️ グローバル設定")
-tf_choice = st.sidebar.selectbox("使用する時間足", ["5m", "1h", "2h", "3h", "6h", "12h", "1d"], index=1)
+# 【変更箇所】使用する時間足に 4h と 5h を追加
+tf_choice = st.sidebar.selectbox("使用する時間足", ["5m", "1h", "2h", "3h", "4h", "5h", "6h", "12h", "1d"], index=1)
 bt_duration = st.sidebar.selectbox("バックテスト期間", ["1日", "1週間", "1ヶ月", "1年"], index=1)
 
 col_btn1, col_btn2 = st.sidebar.columns(2)
