@@ -85,7 +85,7 @@ def fetch_and_resample_data(ticker, timeframe, duration_days):
     
     yf_intervals = {"5m": "5m", "1h": "1h", "1d": "1d"}
     
-    # yfinanceからデータを取得 (2h, 3h, 6h, 12hの場合はまず1h足を取得)
+    # yfinanceからデータを取得
     interval_to_fetch = yf_intervals[timeframe] if timeframe in yf_intervals else "1h"
     df = yf.download(ticker, start=start_date, end=end_date, interval=interval_to_fetch, progress=False)
         
@@ -96,13 +96,12 @@ def fetch_and_resample_data(ticker, timeframe, duration_days):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
         
-    # 2h, 3h, 6h, 12hは1h足からリサンプル
+    # リサンプル処理
     if timeframe not in yf_intervals:
         logic = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
         if 'Volume' in df.columns:
             logic['Volume'] = 'sum'
             
-        # timeframe ("2h", "3h", "6h", "12h") をそのままリサンプルのルールとして使用
         resample_rule = timeframe
         df = df.resample(resample_rule).apply(logic).dropna()
         
@@ -128,7 +127,7 @@ def train_and_predict(df, target_dt_utc, prediction_steps=6):
 
     if len(train_data) < 50: return None
 
-    # ターゲット作成 (指定本数後の足)
+    # ターゲット作成
     df['Target_Price'] = df['Close'].shift(-prediction_steps)
     df['Target'] = (df['Target_Price'] > df['Close']).astype(int)
     
@@ -177,7 +176,7 @@ def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_pri
                 
     return hit_result, hit_price, close_time, entry_price
 
-# --- 最強設定探索 (期間・時間足・JST対応版) ---
+# --- 最強設定探索 (改良版：DRAW時の正確な損益計算に対応) ---
 @st.cache_data(show_spinner=False, ttl=3600)
 def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None):
     duration_map = {"1日": 1, "1週間": 7, "1ヶ月": 30, "1年": 365}
@@ -188,7 +187,6 @@ def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None):
     best_combo = None
     usdjpy_rate = get_usdjpy_rate()
     
-    # ログ表示用に日本時間のタイムゾーンを設定
     jst = pytz.timezone('Asia/Tokyo')
     
     for tk in tickers:
@@ -201,7 +199,6 @@ def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None):
         
         if len(train_df) < 50 or len(test_df) < 10: continue
         
-        # 特定ペア最適化の場合は予測ステップ(h)も探索範囲に入れる
         step_grid = [1, 3, 6, 12] if specific_ticker else [6]
         
         for h in step_grid:
@@ -234,11 +231,21 @@ def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None):
                         res, exit_p, exit_t, entry_p = simulate_trade(df, curr_time, direction, row['Close'], tp_p, sl_p, h)
                         
                         if res != "NO_DATA":
-                            r_score = rr if res == "WIN" else (-1.0 if res == "LOSS" else 0.0)
+                            # ⚠️ 【修正箇所】DRAW時の正確な損益（Rスコア）の計算
+                            if res == "WIN":
+                                r_score = rr
+                            elif res == "LOSS":
+                                r_score = -1.0
+                            else: # res == "DRAW"
+                                if sl_dist > 0:
+                                    p_dist = exit_p - entry_p if direction == "BUY" else entry_p - exit_p
+                                    r_score = p_dist / sl_dist
+                                else:
+                                    r_score = 0.0
+
                             total_r += r_score
                             next_entry = exit_t
                             
-                            # ログを記録する際にUTCからJSTへ変換
                             entry_time_jst = curr_time.astimezone(jst).strftime('%m/%d %H:%M')
                             exit_time_jst = exit_t.astimezone(jst).strftime('%m/%d %H:%M')
                             
@@ -248,7 +255,6 @@ def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None):
                                 "Exit価格": f"{exit_p:.5f}", "結果": res, "Rスコア": r_score
                             })
                             
-                            # 通貨単位計算
                             if sl_dist > 0:
                                 u = 10000 / (sl_dist * (usdjpy_rate if "USD" in tk else 1.0))
                             else:
@@ -272,7 +278,6 @@ st.title("💹 AI FX マルチタイムフレーム・トレーダー")
 
 # --- サイドバー ---
 st.sidebar.header("🎛️ グローバル設定")
-# 【変更箇所】使用する時間足に 2h と 3h を追加
 tf_choice = st.sidebar.selectbox("使用する時間足", ["5m", "1h", "2h", "3h", "6h", "12h", "1d"], index=1)
 bt_duration = st.sidebar.selectbox("バックテスト期間", ["1日", "1週間", "1ヶ月", "1年"], index=1)
 
@@ -370,4 +375,12 @@ if st.button("🚀 予測実行"):
 if 'best_logs' in st.session_state:
     st.markdown("---")
     st.subheader("📑 バックテスト詳細履歴 (最強設定のログ)")
-    st.table(pd.DataFrame(st.session_state.best_logs))
+    
+    # Rスコアを小数点以下4桁で見やすくフォーマット
+    formatted_logs = []
+    for log in st.session_state.best_logs:
+        formatted_log = log.copy()
+        formatted_log['Rスコア'] = f"{log['Rスコア']:.4f}"
+        formatted_logs.append(formatted_log)
+        
+    st.table(pd.DataFrame(formatted_logs))
