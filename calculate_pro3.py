@@ -85,31 +85,26 @@ def fetch_and_resample_data(ticker, timeframe, duration_days):
     
     yf_intervals = {"5m": "5m", "1h": "1h", "1d": "1d"}
     
-    # yfinanceからデータを取得 (2h, 3h, 4h, 5h, 6h, 12hの場合はまず1h足を取得)
     interval_to_fetch = yf_intervals[timeframe] if timeframe in yf_intervals else "1h"
     df = yf.download(ticker, start=start_date, end=end_date, interval=interval_to_fetch, progress=False)
         
     if df is None or df.empty: 
         return None
     
-    # マルチインデックス対応をリサンプルの「前」に行う
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
         
-    # 2h, 3h, 4h, 5h, 6h, 12hは1h足からリサンプル
     if timeframe not in yf_intervals:
         logic = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
         if 'Volume' in df.columns:
             logic['Volume'] = 'sum'
             
-        # timeframe ("2h", "3h", "4h", "5h", "6h", "12h") をそのままリサンプルのルールとして使用
         resample_rule = timeframe
         df = df.resample(resample_rule).apply(logic).dropna()
         
     if df.empty: 
         return None
         
-    # タイムゾーン処理
     if df.index.tz is None:
         df.index = df.index.tz_localize('UTC')
     else:
@@ -128,7 +123,6 @@ def train_and_predict(df, target_dt_utc, prediction_steps=6):
 
     if len(train_data) < 50: return None
 
-    # ターゲット作成
     df['Target_Price'] = df['Close'].shift(-prediction_steps)
     df['Target'] = (df['Target_Price'] > df['Close']).astype(int)
     
@@ -141,7 +135,6 @@ def train_and_predict(df, target_dt_utc, prediction_steps=6):
 
     proba = model.predict_proba(prediction_row[features])[0]
     
-    # 指標重要度
     fi_df = pd.DataFrame({'Feature': features, 'Importance': model.feature_importances_}).sort_values(by='Importance', ascending=False)
     
     return proba, prediction_row['Close'].values[0], prediction_row['ATR'].values[0], prediction_row['ADX'].values[0], fi_df, prediction_row.index[0]
@@ -158,7 +151,6 @@ def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_pri
     close_time = future_candles.index[-1]
     
     for idx, row in future_candles.iterrows():
-        # 買いの場合
         if trade_type == "BUY":
             if row['Low'] <= sl_price:
                 hit_result, hit_price, close_time = "LOSS", sl_price, idx
@@ -166,7 +158,6 @@ def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_pri
             elif row['High'] >= tp_price:
                 hit_result, hit_price, close_time = "WIN", tp_price, idx
                 break
-        # 売りの場合
         else:
             if row['High'] >= sl_price:
                 hit_result, hit_price, close_time = "LOSS", sl_price, idx
@@ -177,9 +168,9 @@ def simulate_trade(df, start_time_utc, trade_type, entry_price, tp_price, sl_pri
                 
     return hit_result, hit_price, close_time, entry_price
 
-# --- 最強設定探索 (改良版：DRAW時の正確な損益計算に対応) ---
+# --- 最強設定探索 (時間指定フィルター追加版) ---
 @st.cache_data(show_spinner=False, ttl=3600)
-def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None):
+def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None, use_time_filter=False, time_start=None, time_end=None):
     duration_map = {"1日": 1, "1週間": 7, "1ヶ月": 30, "1年": 365}
     days = duration_map[duration_key]
     tickers = [specific_ticker] if specific_ticker else ["USDJPY=X", "EURUSD=X", "GBPUSD=X", "GC=F", "BTC-USD", "ETH-USD", "SI=F"]
@@ -219,6 +210,19 @@ def find_best_settings_dynamic(timeframe, duration_key, specific_ticker=None):
                     
                     for i in range(len(test_df)):
                         curr_time = test_df.index[i]
+                        
+                        # ⚠️ 【新機能】時間指定フィルター（JSTでの判定）
+                        if use_time_filter:
+                            curr_time_jst = curr_time.astimezone(jst).time()
+                            if time_start < time_end:
+                                # 通常の時間帯 (例: 10:00 〜 15:00)
+                                if not (time_start <= curr_time_jst <= time_end):
+                                    continue
+                            else:
+                                # 日またぎの時間帯 (例: 19:00 〜 02:00)
+                                if not (curr_time_jst >= time_start or curr_time_jst <= time_end):
+                                    continue
+                        
                         if next_entry and curr_time <= next_entry: continue
                         
                         row = test_df.iloc[i]
@@ -278,9 +282,19 @@ st.title("💹 AI FX マルチタイムフレーム・トレーダー")
 
 # --- サイドバー ---
 st.sidebar.header("🎛️ グローバル設定")
-# 【変更箇所】使用する時間足に 4h と 5h を追加
 tf_choice = st.sidebar.selectbox("使用する時間足", ["5m", "1h", "2h", "3h", "4h", "5h", "6h", "12h", "1d"], index=1)
 bt_duration = st.sidebar.selectbox("バックテスト期間", ["1日", "1週間", "1ヶ月", "1年"], index=1)
+
+# 【追加機能】エントリー時間の指定
+use_time_filter = st.sidebar.checkbox("🕒 エントリー時間を指定する (JST)", value=False)
+if use_time_filter:
+    col_t1, col_t2 = st.sidebar.columns(2)
+    with col_t1:
+        time_start = st.time_input("開始", value=time(19, 0))
+    with col_t2:
+        time_end = st.time_input("終了", value=time(23, 59))
+else:
+    time_start, time_end = None, None
 
 col_btn1, col_btn2 = st.sidebar.columns(2)
 with col_btn1:
@@ -314,7 +328,7 @@ def display_best_result(best):
 
 if btn_all:
     with st.spinner("全通貨・全設定を総当たり検証中..."):
-        best = find_best_settings_dynamic(tf_choice, bt_duration)
+        best = find_best_settings_dynamic(tf_choice, bt_duration, use_time_filter=use_time_filter, time_start=time_start, time_end=time_end)
         if best: display_best_result(best)
         else: st.sidebar.warning("有効な設定が見つかりませんでした。")
 
@@ -323,7 +337,7 @@ ticker1 = st.sidebar.text_input("分析通貨 1", "USDJPY=X")
 
 if btn_specific:
     with st.spinner(f"{ticker1} の最適設定を算出中..."):
-        best = find_best_settings_dynamic(tf_choice, bt_duration, specific_ticker=ticker1)
+        best = find_best_settings_dynamic(tf_choice, bt_duration, specific_ticker=ticker1, use_time_filter=use_time_filter, time_start=time_start, time_end=time_end)
         if best: display_best_result(best)
         else: st.sidebar.warning(f"{ticker1} の有効な設定が見つかりませんでした。")
 
